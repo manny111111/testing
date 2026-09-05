@@ -72,13 +72,8 @@ namespace AimMath
     }
 
     // Angle delta -> pixel delta
-    // For SendInput: we move relative pixels.
-    // Formula: pixels = (angleDelta / sensitivity) * (screenW / fovDeg)
-    // We use a simple multiplier based on 1000 DPI / sensitivity 1.0 baseline.
     inline float AngleToPix(float angleDelta, float sensitivity = 1.f)
     {
-        // CS2: 1 degree = ~5.86 raw counts at sens 1.0, 400 DPI
-        // We use a tunable factor; adjust in config if needed.
         constexpr float kFactor = 4.8f;
         return angleDelta * kFactor / sensitivity;
     }

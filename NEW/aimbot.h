@@ -10,6 +10,7 @@
 #include <thread>
 #include <atomic>
 #include <algorithm>
+#include <chrono>
 
 #include "game.h"
 #include "mem.h"
@@ -21,10 +22,12 @@
 // ── Aimbot settings ───────────────────────────────────────────
 struct AimbotSettings
 {
-    std::atomic<bool>  enabled      { true };
+    // Disabled by default for safety — user must explicitly enable aimbot.
+    std::atomic<bool>  enabled      { false };
     std::atomic<bool>  silentAim    { false };
     std::atomic<bool>  teamCheck    { true };
-    std::atomic<int>   hotkey       { VK_LBUTTON };   // default: LMB hold
+    // No default hotkey (0 = none). Prevents accidental LMB triggering while clicking UI.
+    std::atomic<int>   hotkey       { 0 };
     std::atomic<float> fov          { 5.f };           // degrees
     std::atomic<float> smooth       { 5.f };           // higher = slower
     std::atomic<float> targetBone   { (float)BoneID::head };
@@ -122,7 +125,8 @@ private:
         {
             auto t0 = std::chrono::high_resolution_clock::now();
 
-            if (gAimbot.enabled && gMem.IsValid())
+            // Only call Tick when enabled and memory interface valid.
+            if (gAimbot.enabled.load() && gMem.IsValid())
                 Tick();
 
             auto elapsed = std::chrono::high_resolution_clock::now() - t0;
@@ -134,11 +138,28 @@ private:
 
     void Tick()
     {
-        // Check hotkey
-        if (!(GetAsyncKeyState(gAimbot.hotkey.load()) & 0x8000)) return;
+        // Safety: require a configured hotkey
+        int hk = gAimbot.hotkey.load();
+        if (hk == 0) return;
+
+        // Only operate when the game window is foreground to avoid stealing desktop input.
+        HWND fg = GetForegroundWindow();
+        HWND target = FindWindowA(nullptr, "Counter-Strike 2");
+        if (!target || fg != target) return;
+
+        // Check hotkey state
+        if (!(GetAsyncKeyState(hk) & 0x8000)) return;
 
         // Validate local player
         if (!gLocalPlayer.valid || !gLocalPlayer.alive) return;
+
+        // Rate limiter: avoid calling SendInput too often (protect system responsiveness)
+        static auto lastMove = std::chrono::high_resolution_clock::time_point{};
+        auto now = std::chrono::high_resolution_clock::now();
+        constexpr auto kMinInterval = std::chrono::milliseconds(2); // >=2ms between moves
+        if (lastMove.time_since_epoch().count() != 0 && (now - lastMove) < kMinInterval)
+            return;
+        lastMove = now;
 
         // Local eye position (origin + eye height ~64 units in CS2)
         Vec3 eyePos = gLocalPlayer.origin;
@@ -152,7 +173,7 @@ private:
         {
             const PlayerData& p = gPlayers[i];
             if (!p.valid || !p.alive || p.dormant) continue;
-            if (gAimbot.teamCheck && p.team == gLocalPlayer.team) continue;
+            if (gAimbot.teamCheck.load() && p.team == gLocalPlayer.team) continue;
 
             int boneIdx = static_cast<int>(gAimbot.targetBone.load());
             Vec3 bonePos = p.bonePos[boneIdx];
@@ -171,11 +192,11 @@ private:
 
         // Calculate angle delta
         int boneIdx = static_cast<int>(gAimbot.targetBone.load());
-        Vec3 target = gPlayers[bestIdx].bonePos[boneIdx];
+        Vec3 targetPos = gPlayers[bestIdx].bonePos[boneIdx];
         Vec3 eyePos2 = gLocalPlayer.origin;
         eyePos2.z += 64.f;
 
-        AimMath::Angles targetAng = AimMath::CalcAngle(eyePos2, target);
+        AimMath::Angles targetAng = AimMath::CalcAngle(eyePos2, targetPos);
         float dPitch = AimMath::NormalizeAngle(targetAng.pitch - viewAngles.x);
         float dYaw   = AimMath::NormalizeAngle(targetAng.yaw   - viewAngles.y);
 
@@ -188,14 +209,10 @@ private:
         int pxY = static_cast<int>(AimMath::AngleToPix(dPitch));
         int pxX = static_cast<int>(AimMath::AngleToPix(dYaw));
 
-        if (gAimbot.silentAim)
+        if (gAimbot.silentAim.load())
         {
-            // Silent aim: write view angles directly via RPM (no mouse move visible)
-            // Direct angle write requires write access – but we only have PROCESS_VM_READ.
-            // True silent aim requires PROCESS_VM_WRITE; we skip the actual write here
-            // and fall through to the SendInput path to avoid crashing.
-            // If you add PROCESS_VM_WRITE, write to:
-            //   gMem.clientBase + off::dwViewAngles  (pitch, yaw, roll)
+            // Silent aim: would write view angles directly if write access were available.
+            // We intentionally do not perform memory writes here.
         }
 
         MoveMouse(pxX, pxY);
